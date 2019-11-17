@@ -44,8 +44,8 @@ class RuuviSender():
             self.send_data()
 
     def handle_data(self, found_data):
-        print('MAC ' + found_data[0])
-        print(found_data[1])
+#        print('MAC ' + found_data[0])
+#        print(found_data[1])
         # key is mac-address, value is measurement data dictionary
         self.datastore[found_data[0]] = found_data[1]
 
@@ -73,7 +73,7 @@ class RuuviSender():
                 }
             }
         ]
-        print("returning json with timestamp " + str_timestamp)
+#        print("returning json with timestamp " + str_timestamp)
         return json_temp
 
     def send_data(self):
@@ -82,7 +82,7 @@ class RuuviSender():
             json = self.create_influx_json(mac, self.datastore[mac])
 
             client = InfluxDBClient(conf.INFLUXDB_HOST, conf.INFLUXDB_PORT, conf.INFLUXDB_USER, conf.INFLUXDB_PWD, conf.INFLUXDB_DATABASE, timeout=5)
-            influx.write_points(json)
+            client.write_points(json)
 
 ###########################################
 # Main function

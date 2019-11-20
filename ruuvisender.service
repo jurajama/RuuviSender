@@ -4,7 +4,7 @@ After=multi-user.target
 
 [Service]
 Type=idle
-ExecStart=/usr/bin/python /home/pi/RuuviSender/RuuviSender.py
+ExecStart=/usr/bin/python3 /home/pi/RuuviSender/RuuviSender.py
 PIDFile=/var/run/ruuvisender.pid
 Restart=always
 RestartSec=20

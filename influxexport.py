@@ -1,6 +1,6 @@
 # Script for exporting measurement data from Influxdb to csv-file
 # Usage:
-# - pip3 install influxdb
+# - Install the dependencies: venv/bin/pip install -r requirements.txt
 # - Make sure that my_config.py contains your Influxdb connection information.
 # - Edit days_to_fetch to define how many days of data shall be fetched.
 # - Fetch is done in multiple batches to avoid too heavy individual queries. 
@@ -24,10 +24,11 @@ delta = datetime.timedelta(days=batch_size_days)
 # Set number of days to fetch
 days_to_fetch = 365
 
-# Calculate time range for first query
-end_time = datetime.datetime.utcnow()
-start_time_str = (end_time - datetime.timedelta(days=days_to_fetch)).strftime('%Y-%m-%dT%H:%M:%SZ')
-start_time = datetime.datetime.strptime(start_time_str, '%Y-%m-%dT%H:%M:%SZ')
+TIME_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
+
+# Calculate time range for first query (timezone-aware UTC datetimes, seconds precision)
+end_time = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+start_time = end_time - datetime.timedelta(days=days_to_fetch)
 
 # Initialize CSV file and write header
 with open(FILENAME, 'w', newline='') as csvfile:
@@ -38,14 +39,14 @@ with open(FILENAME, 'w', newline='') as csvfile:
 while end_time > start_time:
     # Calculate time range for current query
     query_end_time = end_time
-    query_start_time = (query_end_time - delta).strftime('%Y-%m-%dT%H:%M:%SZ')
-    if datetime.datetime.strptime(query_start_time, '%Y-%m-%dT%H:%M:%SZ') < start_time:
-        query_start_time = start_time_str
+    query_start_time = max(query_end_time - delta, start_time)
 
-    print(f"query_start_time: {query_start_time}   query_end_time: {query_end_time}")
+    start_str = query_start_time.strftime(TIME_FORMAT)
+    end_str = query_end_time.strftime(TIME_FORMAT)
+    print(f"query_start_time: {start_str}   query_end_time: {end_str}")
 
     # Query data from InfluxDB for current batch
-    query = f'SELECT "temperature", "humidity", "pressure", "sensorId" FROM "temps" WHERE time >= \'{query_start_time}\' AND time <= \'{query_end_time}\''
+    query = f'SELECT "temperature", "humidity", "pressure", "sensorId" FROM "temps" WHERE time >= \'{start_str}\' AND time <= \'{end_str}\''
     results = client.query(query)
 
     # Write data to CSV file
@@ -61,6 +62,6 @@ while end_time > start_time:
                 writer.writerow([timestamp, sensor_id, temperature, humidity, pressure])
 
     # Update time range for next query
-    end_time = datetime.datetime.fromisoformat(query_start_time[:-1])
+    end_time = query_start_time
 
 print(f"Data exported to {FILENAME}")

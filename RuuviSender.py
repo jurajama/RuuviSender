@@ -1,112 +1,106 @@
-#! /usr/bin/python
-# -*- coding: utf-8 -*-
-import os, sys, datetime, io, time,traceback, requests, logging, threading
+#!/usr/bin/env python3
+"""Listen to RuuviTag broadcasts and send the measurements to InfluxDB.
 
-from logging.handlers import RotatingFileHandler
+The latest reading of every tag heard during the last SEND_INTERVAL seconds is
+written to the "temps" measurement (tag "sensorId" = MAC address). Bluetooth
+scanning uses the asynchronous BlueZ/D-Bus based ``bleak`` adapter of the
+ruuvitag_sensor package.
+"""
+import asyncio
+import logging
+import signal
+from datetime import datetime, timezone
+
 from influxdb import InfluxDBClient
 from ruuvitag_sensor.ruuvi import RuuviTagSensor
 
 import my_config as conf
 
-# This application listens to RuuviTag broadcasts and sends data to InfluxDB database.
+SEND_INTERVAL = 60        # seconds between InfluxDB writes
+SCAN_RETRY_DELAY = 20     # seconds to wait before restarting a failed BLE scan
+FIELDS = ("temperature", "humidity", "pressure")
 
-G_SEND_INTERVAL = 60
+log = logging.getLogger("RuuviSender")
 
-log = None
 
-g_callback = None
+async def scan(readings: dict) -> None:
+    """Collect the latest reading of each tag into ``readings`` (MAC -> data).
 
-def scanthread():
-    RuuviTagSensor.get_datas(g_callback)
+    Restarts the scan if it fails, e.g. because Bluetooth was reset.
+    """
+    while True:
+        try:
+            async for mac, data in RuuviTagSensor.get_data_async():
+                readings[mac] = data
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("BLE scan failed, retrying in %d s", SCAN_RETRY_DELAY)
+        else:
+            log.error("BLE scan ended unexpectedly, retrying in %d s", SCAN_RETRY_DELAY)
+        await asyncio.sleep(SCAN_RETRY_DELAY)
 
-class RuuviSender():
-    def __init__(self, run_as_service = False):
-        self.run_as_service = run_as_service
-        self._running = False
 
-        self.datastore = {}
-
-        if run_as_service:
-            self.write_pid_file()
-
-    def start(self):
-        global g_callback
-        g_callback = self.handle_data
-
-        self._running = True
-
-        thread1 = threading.Thread(target = scanthread, args = ())
-        thread1.daemon = True
-        thread1.start()
-
-        while(self._running):
-            time.sleep(G_SEND_INTERVAL)
-            self.send_data()
-
-    def handle_data(self, found_data):
-#        print('MAC ' + found_data[0])
-#        print(found_data[1])
-        # key is mac-address, value is measurement data dictionary
-        self.datastore[found_data[0]] = found_data[1]
-
-    def write_pid_file(self):
-        pid = str(os.getpid())
-        f = open('/var/run/ruuvisender.pid', 'w')
-        f.write(pid)
-        f.close()
-
-    def create_influx_json(self, mac, data):
-        timestamp = datetime.datetime.utcnow()
-        str_timestamp = timestamp.isoformat("T") + "Z"
-
-        json_temp = [
-            {
+def create_points(readings: dict) -> list:
+    """Convert readings to InfluxDB points; values a tag does not report are skipped."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+    points = []
+    for mac, data in readings.items():
+        fields = {f: data[f] for f in FIELDS if data.get(f) is not None}
+        if fields:
+            points.append({
                 "measurement": "temps",
-                "tags": {
-                    "sensorId": mac
-                },
-                "time": str_timestamp,
-                "fields": {
-                   "temperature": data["temperature"],
-                   "humidity": data["humidity"],
-                   "pressure": data["pressure"]
-                }
-            }
-        ]
-#        print("returning json with timestamp " + str_timestamp)
-        return json_temp
+                "tags": {"sensorId": mac},
+                "time": timestamp,
+                "fields": fields,
+            })
+    return points
 
-    def send_data(self):
-#        print("in send_data")
-        for mac in self.datastore:
-            json = self.create_influx_json(mac, self.datastore[mac])
 
-            client = InfluxDBClient(conf.INFLUXDB_HOST, conf.INFLUXDB_PORT, conf.INFLUXDB_USER, conf.INFLUXDB_PWD, conf.INFLUXDB_DATABASE, timeout=5)
-            client.write_points(json)
+def write_points(points: list) -> None:
+    """Blocking InfluxDB write (run in a worker thread)."""
+    with InfluxDBClient(conf.INFLUXDB_HOST, conf.INFLUXDB_PORT, conf.INFLUXDB_USER,
+                        conf.INFLUXDB_PWD, conf.INFLUXDB_DATABASE, timeout=5) as client:
+        client.write_points(points)
 
-###########################################
-# Main function
-###########################################
 
-if __name__ == '__main__':
+async def send_periodically(readings: dict) -> None:
+    """Every SEND_INTERVAL seconds write the readings received since the last write."""
+    while True:
+        await asyncio.sleep(SEND_INTERVAL)
+        # Hand over the readings and start collecting fresh ones, so a tag that
+        # went out of range is not reported with a stale value.
+        batch = dict(readings)
+        readings.clear()
+        points = create_points(batch)
+        if not points:
+            log.warning("No RuuviTag data received during the last %d s", SEND_INTERVAL)
+            continue
+        try:
+            await asyncio.to_thread(write_points, points)
+            log.debug("Sent %d reading(s) to InfluxDB", len(points))
+        except Exception:
+            log.exception("Writing to InfluxDB failed")
 
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)
-    handler = logging.handlers.SysLogHandler(address = '/dev/log')
-    formatter = logging.Formatter('%(module)s.%(funcName)s: %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
 
-    logger.error("RuuviSender starting")
+async def main() -> None:
+    readings: dict = {}
+    tasks = [asyncio.create_task(scan(readings)),
+             asyncio.create_task(send_periodically(readings))]
 
-    sender = RuuviSender(run_as_service = True)
+    # Stop cleanly on SIGTERM (systemctl stop) and SIGINT (Ctrl-C).
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: [t.cancel() for t in tasks])
 
+    log.info("RuuviSender starting")
     try:
-        sender.start()
-    except KeyboardInterrupt:
-        logger.error("Shutting down after KeyboardInterrupt")
-    except:
-        logger.error("Exception in router_monitor")
-        logger.error(traceback.format_exc())
-        raise
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        log.info("RuuviSender shutting down")
 
+
+if __name__ == "__main__":
+    # stderr goes to the systemd journal when run as a service
+    logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
+    asyncio.run(main())
